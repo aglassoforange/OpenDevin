@@ -2517,3 +2517,6 @@
 [2024-08-28 13:27:03]     raise Exception(f'Build failed: {result}')
 [2024-08-28 13:27:03] Exception: Build failed: CompletedProcess(args='python -m build -s /app', returncode=1)
 [2024-08-28 13:27:03] [92m17:27:03 - openhands:INFO[0m: session.py:139 - Server event
+[2024-08-28 14:39:36] [92m18:39:36 - openhands:INFO[0m: session.py:65 - WebSocket disconnected, sid: c5176301-3869-4fe1-9e9d-7dc2e9a4ab1d
+[2024-08-28 14:39:36] [32mINFO[0m:     connection closed
+[2024-08-28 14:41:27] [92m18:41:27 - openhands:INFO[0m: manager.py:65 - Session c5176301-3869-4fe1-9e9d-7dc2e9a4ab1d and related resource have been removed due to inactivity.
