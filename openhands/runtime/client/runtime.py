@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import threading
@@ -5,9 +6,11 @@ import time
 import uuid
 from zipfile import ZipFile
 
+import asyncio
 import docker
 import requests
 import tenacity
+import websockets
 
 from openhands.core.config import AppConfig
 from openhands.core.logger import openhands_logger as logger
@@ -49,7 +52,7 @@ class LogBuffer:
     def __init__(self, container: docker.models.containers.Container):
         self.client_ready = False
         self.init_msg = 'Runtime client initialized.'
-
+        
         self.buffer: list[str] = []
         self.lock = threading.Lock()
         self.log_generator = container.logs(stream=True, follow=True)
@@ -117,7 +120,7 @@ class EventStreamRuntime(Runtime):
         self.config = config
         self._port = find_available_tcp_port()
         self.api_url = f'http://{self.config.sandbox.api_hostname}:{self._port}'
-        self.session = requests.Session()
+        #self.session = requests.Session()
 
         self.instance_id = (
             sid + '_' + str(uuid.uuid4()) if sid is not None else str(uuid.uuid4())
@@ -129,6 +132,9 @@ class EventStreamRuntime(Runtime):
 
         self.container = None
         self.action_semaphore = threading.Semaphore(1)  # Ensure one action at a time
+        #initialize the websocket connection
+        self.websocket = None
+        asyncio.run(self._init_websocket_connection())
 
         self.runtime_builder = DockerRuntimeBuilder(self.docker_client)
         logger.debug(f'EventStreamRuntime `{sid}`')
@@ -343,63 +349,45 @@ class EventStreamRuntime(Runtime):
         if close_client:
             self.docker_client.close()
 
-    def run_action(self, action: Action) -> Observation:
+    async def run_action(self, action: Action) -> Observation:
         # set timeout to default if not set
         if action.timeout is None:
             action.timeout = self.config.sandbox.timeout
+        if not action.runnable:
+            return NullObservation('')
+        if (
+            hasattr(action, 'is_confirmed')
+            and action.is_confirmed == ActionConfirmationStatus.AWAITING_CONFIRMATION
+        ):
+            return NullObservation('')
 
-        with self.action_semaphore:
-            if not action.runnable:
-                return NullObservation('')
-            if (
-                hasattr(action, 'is_confirmed')
-                and action.is_confirmed
-                == ActionConfirmationStatus.AWAITING_CONFIRMATION
-            ):
-                return NullObservation('')
-            action_type = action.action  # type: ignore[attr-defined]
-            if action_type not in ACTION_TYPE_TO_CLASS:
-                return ErrorObservation(f'Action {action_type} does not exist.')
-            if not hasattr(self, action_type):
-                return ErrorObservation(
-                    f'Action {action_type} is not supported in the current runtime.'
-                )
-            if (
-                hasattr(action, 'is_confirmed')
-                and action.is_confirmed == ActionConfirmationStatus.REJECTED
-            ):
-                return UserRejectObservation(
-                    'Action has been rejected by the user! Waiting for further user input.'
-                )
+        action_type = action.action
+        if action_type not in ACTION_TYPE_TO_CLASS:
+            return ErrorObservation(f'Action {action_type} does not exist.')
+        if not hasattr(self, action_type):
+            return ErrorObservation(f'Action {action_type} is not supported in the current runtime.')
 
-            logger.info('Awaiting session')
-            self._wait_until_alive()
+        if hasattr(action, 'is_confirmed') and action.is_confirmed == ActionConfirmationStatus.REJECTED:
+            return UserRejectObservation('Action has been rejected by the user! Waiting for further user input.')
 
-            assert action.timeout is not None
+        await self.connect()
+
+        try:
+            action_data = json.dumps(event_to_dict(action))
+            await self.websocket.send(action_data)
 
             try:
-                response = self.session.post(
-                    f'{self.api_url}/execute_action',
-                    json={'action': event_to_dict(action)},
-                    timeout=action.timeout,
-                )
-                if response.status_code == 200:
-                    output = response.json()
-                    obs = observation_from_dict(output)
-                    obs._cause = action.id  # type: ignore[attr-defined]
-                    return obs
-                else:
-                    error_message = response.text
-                    logger.error(f'Error from server: {error_message}')
-                    obs = ErrorObservation(f'Command execution failed: {error_message}')
-            except requests.Timeout:
-                logger.error('No response received within the timeout period.')
-                obs = ErrorObservation('Command execution timed out')
-            except Exception as e:
-                logger.error(f'Error during command execution: {e}')
-                obs = ErrorObservation(f'Command execution failed: {str(e)}')
-            return obs
-
+                response = await asyncio.wait_for(self.websocket.recv(), timeout=action.timeout)
+                response_data = json.loads(response)
+                obs = observation_from_dict(response_data)
+                obs._cause = action.id
+                return obs
+            except asyncio.TimeoutError:
+                return ErrorObservation('Command execution timed out')
+        except Exception as e:
+            return ErrorObservation(f'Command execution failed: {str(e)}')
+        finally:
+            await self.disconnect()
     def run(self, action: CmdRunAction) -> Observation:
         return self.run_action(action)
 
@@ -494,3 +482,40 @@ class EventStreamRuntime(Runtime):
             raise TimeoutError('List files operation timed out')
         except Exception as e:
             raise RuntimeError(f'List files operation failed: {str(e)}')
+
+
+    async def _init_websocket_connection(self):
+        """Establish a persistent WebSocket connection."""
+        self.websocket = await websockets.connect(self.api_url)
+        print("WebSocket connection established with the runtime client")
+
+    async def send_action(self, action: dict) -> dict:
+        """Send an action over WebSocket and receive the observation."""
+        if self.websocket is None:
+            raise ConnectionError("WebSocket connection is not established.")
+        
+        # Send the action over WebSocket
+        await self.websocket.send(json.dumps(action))
+        
+        # Wait for the response (observation)
+        response = await self.websocket.recv()
+        return json.loads(response)
+
+    def run_action(self, action: Action) -> Observation:
+        """Execute the action using WebSocket and return the observation."""
+        # Convert the action to a dictionary
+        action_dict = event_to_dict(action)
+
+        # Send the action over WebSocket and receive the observation
+        observation_dict = asyncio.run(self.send_action(action_dict))
+
+        # Convert the received observation dict back to an Observation object
+        observation = observation_from_dict(observation_dict)
+        return observation
+
+    def close(self):
+        """Close the WebSocket connection when done."""
+        if self.websocket:
+            asyncio.run(self.websocket.close())
+            print("WebSocket connection closed")
+        super().close()

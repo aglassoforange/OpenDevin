@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pexpect
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from uvicorn import run
@@ -686,3 +686,65 @@ if __name__ == '__main__':
 
     logger.info(f'Starting action execution API on port {args.port}')
     run(app, host='0.0.0.0', port=args.port)
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket handler for executing actions."""
+    await websocket.accept()
+
+    try:
+        while True:
+            # Wait for an action from the WebSocket connection
+            action_message = await websocket.receive_text()
+
+            # Deserialize the action
+            action_dict = json.loads(action_message)
+            action = event_from_dict(action_dict)
+
+            # Process the action using RuntimeClient
+            observation = await client.run_action(action)
+
+            # Send the observation back to the WebSocket client
+            await websocket.send_text(json.dumps(event_to_dict(observation)))
+
+    except WebSocketDisconnect:
+        print("WebSocket disconnected")
+        await websocket.close()
+
+    except Exception as e:
+        print(f"Error in WebSocket communication: {str(e)}")
+        await websocket.close()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--working-dir', type=str, help='Working directory')
+    parser.add_argument('--plugins', type=str, help='Plugins to initialize', nargs='+')
+    parser.add_argument('--username', type=str, help='User to run as', default='openhands')
+    parser.add_argument('--user-id', type=int, help='User ID to run as', default=1000)
+    parser.add_argument('--browsergym-eval-env', type=str, help='BrowserGym environment used for browser evaluation', default=None)
+    
+    args = parser.parse_args()
+
+    # Load plugins from the command-line arguments
+    plugins_to_load = []
+    if args.plugins:
+        for plugin in args.plugins:
+            if plugin in ALL_PLUGINS:
+                plugins_to_load.append(ALL_PLUGINS[plugin]())  # Add available plugins
+            else:
+                raise ValueError(f"Plugin {plugin} not found!")
+
+    # Initialize RuntimeClient
+    client = RuntimeClient(
+        plugins_to_load=plugins_to_load,
+        work_dir=args.working_dir,
+        username=args.username,
+        user_id=args.user_id,
+        browsergym_eval_env=args.browsergym_eval_env
+    )
+
+    # Initialize RuntimeClient async (if necessary)
+    asyncio.run(client.ainit())
+
+    # Start the FastAPI WebSocket server
+    uvicorn.run(app, host="0.0.0.0", port=8000)
